@@ -1,0 +1,71 @@
+name: "⚠️ حذف تاریخچه کامیت‌ها (Reset History)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "برای تأیید عبارت RESET را تایپ کنید"
+        required: true
+        type: string
+      new_commit_message:
+        description: "پیام کامیت اولیه جدید"
+        required: false
+        default: "Initial commit (clean history)"
+        type: string
+      branch:
+        description: "شاخه‌ای که پاکسازی می‌شود"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  reset-history:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'RESET'
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reset history
+        run: |
+          BRANCH="${{ github.event.inputs.branch }}"
+          MESSAGE="${{ github.event.inputs.new_commit_message }}"
+
+          # تنظیم هویت گیت (اجباری برای commit)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "⚠️ در حال پاکسازی کامل تاریخچه شاخهٔ $BRANCH ..."
+
+          # ایجاد یک شاخه یتیم (بدون هیچ commit قبلی)
+          git checkout --orphan clean_history
+
+          # اضافه کردن همه فایل‌های فعلی
+          git add -A
+
+          # ساختن تنها یک کامیت جدید
+          git commit -m "$MESSAGE"
+
+          # حذف شاخه قدیمی (محلی)
+          git branch -D "$BRANCH"
+
+          # تغییر نام شاخهٔ یتیم به نام شاخهٔ اصلی
+          git branch -m "$BRANCH"
+
+          # ارسال اجباری (force push) برای بازنویسی تاریخچه
+          git push origin "$BRANCH" --force
+
+          echo "✅ تاریخچه کامیت‌ها با موفقیت حذف شد. اکنون فقط یک کامیت اولیه دارید."
+
+      - name: Clean up remote-tracking references
+        run: |
+          git fetch origin --prune

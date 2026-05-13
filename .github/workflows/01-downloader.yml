@@ -1,0 +1,213 @@
+name: "دانلودر لینک مستقیم"
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct File URL"
+        required: true
+        type: string
+      zip_password:
+        description: "Password for archive (leave empty for no password)"
+        required: false
+        default: ""
+        type: string
+      max_part_mb:
+        description: "Maximum size per part (MB)"
+        required: false
+        default: "90"
+        type: string
+      upload_method:
+        description: "Upload Method"
+        required: true
+        default: "repository"
+        type: choice
+        options:
+          - repository
+          - release
+      release_tag:
+        description: "Release Tag"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl python3 python3-pip
+          pip3 install requests
+
+      - name: Download File with Resume
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+
+          FILE_URL="${{ github.event.inputs.file_url }}"
+
+          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+          FILEPATH="temp_dl/$FILENAME"
+
+          # ذخیره اسکریپت پایتون در فایل موقت
+          cat > /tmp/dl_script.py << 'ENDOFPYTHON'
+          import requests, sys, time
+          from pathlib import Path
+
+          url = sys.argv[1]
+          out_path = Path(sys.argv[2])
+          chunk_size = 64 * 1024
+          max_retries = 10
+
+          temp_path = out_path.with_suffix(out_path.suffix + ".partial")
+          downloaded = temp_path.stat().st_size if temp_path.exists() else 0
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+
+          for attempt in range(max_retries):
+              try:
+                  range_header = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
+                  resp = requests.get(url, stream=True, timeout=30, headers={**headers, **range_header})
+                  resp.raise_for_status()
+
+                  total_size = int(resp.headers.get('content-length', 0))
+                  if downloaded > 0:
+                      total_size += downloaded
+
+                  mode = 'ab' if downloaded > 0 else 'wb'
+                  with open(temp_path, mode) as f:
+                      for chunk in resp.iter_content(chunk_size=chunk_size):
+                          if chunk:
+                              f.write(chunk)
+                              downloaded += len(chunk)
+                              if total_size > 0:
+                                  percent = downloaded / total_size * 100
+                                  bar_len = 40
+                                  filled = int(bar_len * downloaded // total_size)
+                                  bar = '█' * filled + '░' * (bar_len - filled)
+                                  print(f"\rProgress: |{bar}| {percent:.1f}% ({downloaded}/{total_size} bytes)",
+                                        end='', flush=True)
+                  print()
+                  temp_path.rename(out_path)
+                  print(f"✅ Download completed: {out_path.name}")
+                  sys.exit(0)
+              except (requests.exceptions.ChunkedEncodingError,
+                      requests.exceptions.ConnectionError,
+                      requests.exceptions.Timeout) as e:
+                  print(f"\n⚠️ Connection lost: {e}. Retry {attempt+1}/{max_retries}")
+                  time.sleep(2 ** attempt)
+              except Exception as e:
+                  print(f"\n❌ Fatal error: {e}")
+                  sys.exit(1)
+          print("\n❌ Max retries reached.")
+          sys.exit(1)
+          ENDOFPYTHON
+
+          python3 /tmp/dl_script.py "$FILE_URL" "$FILEPATH"
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filepath=$FILEPATH" >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          BASENAME=$(basename "$FILEPATH")
+
+          cd temp_dl || exit 1
+
+          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+
+          if [ -n "$PASS" ]; then
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "./${ARCHIVE_BASE}.7z" "./$BASENAME"
+          else
+            7z a -mx=3 -v${THRESH_MB}m "./${ARCHIVE_BASE}.7z" "./$BASENAME"
+          fi
+
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+
+          cd ..
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+          git checkout main
+          git reset --soft origin/main
+
+          mkdir -p downloads
+          mv temp_dl/*.7z* downloads/ 2>/dev/null || true
+
+          git add downloads/
+
+          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+
+          git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
+          name: Direct Download Release
+          body: |
+            Direct download completed.
+
+            File: ${{ steps.download.outputs.filename }}
+            Date: ${{ steps.get_date.outputs.date }}
+          files: temp_dl/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl
